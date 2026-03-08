@@ -2,110 +2,104 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('railway') ? { rejectUnauthorized: false } : false
 });
 
 async function setupDatabase() {
-  const client = await pool.connect();
-  try {
-    console.log('Creating database tables...');
-    
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS profit_loss (
-        id SERIAL PRIMARY KEY,
-        entity VARCHAR(20) NOT NULL,
-        gm_category VARCHAR(100),
-        pl_category VARCHAR(100),
-        account_name VARCHAR(200) NOT NULL,
-        period_year INTEGER NOT NULL,
-        period_month INTEGER NOT NULL,
-        amount DECIMAL(15,2) DEFAULT 0,
-        data_type VARCHAR(20) DEFAULT 'actual',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+  console.log('Creating database tables...');
 
-      CREATE TABLE IF NOT EXISTS balance_sheet (
-        id SERIAL PRIMARY KEY,
-        entity VARCHAR(20) NOT NULL,
-        mapping_category VARCHAR(100),
-        account_name VARCHAR(200) NOT NULL,
-        period_year INTEGER NOT NULL,
-        period_month INTEGER NOT NULL,
-        amount DECIMAL(15,2) DEFAULT 0,
-        data_type VARCHAR(20) DEFAULT 'actual',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+  // Drop and recreate all tables to ensure schema matches
+  await pool.query(`
+    DROP TABLE IF EXISTS profit_loss CASCADE;
+    DROP TABLE IF EXISTS balance_sheet CASCADE;
+    DROP TABLE IF EXISTS cash_flow CASCADE;
+    DROP TABLE IF EXISTS ar_aging CASCADE;
+    DROP TABLE IF EXISTS budget CASCADE;
+  `);
 
-      CREATE TABLE IF NOT EXISTS cash_flow (
-        id SERIAL PRIMARY KEY,
-        entity VARCHAR(20) NOT NULL,
-        section VARCHAR(100),
-        line_item VARCHAR(200) NOT NULL,
-        period_year INTEGER NOT NULL,
-        period_month INTEGER NOT NULL,
-        amount DECIMAL(15,2) DEFAULT 0,
-        data_type VARCHAR(20) DEFAULT 'actual',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+  await pool.query(`
+    CREATE TABLE profit_loss (
+      id SERIAL PRIMARY KEY,
+      entity VARCHAR(20) NOT NULL,
+      gm_category VARCHAR(100),
+      pl_category VARCHAR(100),
+      account_code VARCHAR(20),
+      account_name VARCHAR(200) NOT NULL,
+      period_year INTEGER NOT NULL,
+      period_month INTEGER NOT NULL,
+      amount DECIMAL(15,2) DEFAULT 0,
+      data_type VARCHAR(20) DEFAULT 'actual',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-      CREATE TABLE IF NOT EXISTS ar_aging (
-        id SERIAL PRIMARY KEY,
-        period_date DATE NOT NULL,
-        current_amount DECIMAL(15,2) DEFAULT 0,
-        days_1_30 DECIMAL(15,2) DEFAULT 0,
-        days_1_30_total DECIMAL(15,2) DEFAULT 0,
-        days_31_60 DECIMAL(15,2) DEFAULT 0,
-        days_61_90 DECIMAL(15,2) DEFAULT 0,
-        days_91_plus DECIMAL(15,2) DEFAULT 0,
-        gross_ar DECIMAL(15,2) DEFAULT 0,
-        bad_debt_reserve DECIMAL(15,2) DEFAULT 0,
-        net_ar DECIMAL(15,2) DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+    CREATE TABLE balance_sheet (
+      id SERIAL PRIMARY KEY,
+      entity VARCHAR(20) NOT NULL,
+      category VARCHAR(100),
+      sub_category VARCHAR(100),
+      account_name VARCHAR(200) NOT NULL,
+      period_year INTEGER NOT NULL,
+      period_month INTEGER NOT NULL,
+      amount DECIMAL(15,2) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-      CREATE TABLE IF NOT EXISTS budget (
-        id SERIAL PRIMARY KEY,
-        line_item VARCHAR(200) NOT NULL,
-        period_year INTEGER NOT NULL,
-        period_month INTEGER NOT NULL,
-        amount DECIMAL(15,2) DEFAULT 0,
-        quarter VARCHAR(10),
-        forecast_type VARCHAR(20) DEFAULT 'forecast',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    CREATE TABLE cash_flow (
+      id SERIAL PRIMARY KEY,
+      entity VARCHAR(20) NOT NULL,
+      category VARCHAR(100),
+      account_name VARCHAR(200) NOT NULL,
+      period_year INTEGER NOT NULL,
+      period_month INTEGER NOT NULL,
+      amount DECIMAL(15,2) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-    // Create indexes
-    const indexes = [
-      'CREATE INDEX IF NOT EXISTS idx_pl_entity_period ON profit_loss(entity, period_year, period_month)',
-      'CREATE INDEX IF NOT EXISTS idx_pl_account ON profit_loss(account_name)',
-      'CREATE INDEX IF NOT EXISTS idx_pl_category ON profit_loss(gm_category, pl_category)',
-      'CREATE INDEX IF NOT EXISTS idx_bs_entity_period ON balance_sheet(entity, period_year, period_month)',
-      'CREATE INDEX IF NOT EXISTS idx_bs_account ON balance_sheet(account_name)',
-      'CREATE INDEX IF NOT EXISTS idx_cf_entity_period ON cash_flow(entity, period_year, period_month)',
-      'CREATE INDEX IF NOT EXISTS idx_ar_date ON ar_aging(period_date)',
-      'CREATE INDEX IF NOT EXISTS idx_budget_period ON budget(period_year, period_month)',
-    ];
+    CREATE TABLE ar_aging (
+      id SERIAL PRIMARY KEY,
+      entity VARCHAR(20) NOT NULL,
+      customer_name VARCHAR(200),
+      aging_bucket VARCHAR(50),
+      amount DECIMAL(15,2) DEFAULT 0,
+      period_year INTEGER NOT NULL,
+      period_month INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-    for (const idx of indexes) {
-      await client.query(idx);
-    }
+    CREATE TABLE budget (
+      id SERIAL PRIMARY KEY,
+      entity VARCHAR(20) NOT NULL,
+      account_name VARCHAR(200) NOT NULL,
+      period_year INTEGER NOT NULL,
+      period_month INTEGER NOT NULL,
+      amount DECIMAL(15,2) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 
-    console.log('All tables and indexes created successfully!');
-    
-    // Show table counts
-    const tables = ['profit_loss', 'balance_sheet', 'cash_flow', 'ar_aging', 'budget'];
-    for (const table of tables) {
-      const res = await client.query(`SELECT COUNT(*) FROM ${table}`);
-      console.log(`  ${table}: ${res.rows[0].count} rows`);
-    }
+  // Create indexes for fast queries
+  await pool.query(`
+    CREATE INDEX idx_pl_entity_period ON profit_loss(entity, period_year, period_month);
+    CREATE INDEX idx_pl_category ON profit_loss(pl_category);
+    CREATE INDEX idx_pl_account ON profit_loss(account_name);
+    CREATE INDEX idx_bs_entity_period ON balance_sheet(entity, period_year, period_month);
+    CREATE INDEX idx_bs_category ON balance_sheet(category);
+    CREATE INDEX idx_cf_entity_period ON cash_flow(entity, period_year, period_month);
+    CREATE INDEX idx_cf_category ON cash_flow(category);
+    CREATE INDEX idx_ar_entity_period ON ar_aging(entity, period_year, period_month);
+    CREATE INDEX idx_ar_bucket ON ar_aging(aging_bucket);
+    CREATE INDEX idx_budget_entity_period ON budget(entity, period_year, period_month);
+    CREATE INDEX idx_budget_account ON budget(account_name);
+  `);
 
-  } catch (err) {
-    console.error('Error setting up database:', err);
-    throw err;
-  } finally {
-    client.release();
+  // Show table status
+  const tables = ['profit_loss', 'balance_sheet', 'cash_flow', 'ar_aging', 'budget'];
+  for (const t of tables) {
+    const r = await pool.query(`SELECT COUNT(*) as count FROM ${t}`);
+    console.log(`  ${t}: ${r.rows[0].count} rows`);
   }
+
+  console.log('All tables and indexes created successfully!');
 }
 
 module.exports = { setupDatabase, pool };
