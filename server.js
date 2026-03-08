@@ -372,26 +372,31 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
 // PARSERS — matched to the exact Excel file structure
 // ================================================================
 
-// Helper: find date columns in a row (dates are datetime strings or contain month abbreviations)
+// Helper: parse a cell into {month, year} if it's a date
+const MONTH_MAP = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+function parseMonthYear(s) {
+  if (!s) return null;
+  s = String(s).trim().toLowerCase();
+  // Match "Jan-22", "Feb-24", "Mar-2022", "Jan 22", etc.
+  const m = s.match(/^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[- ]?(\d{2,4})$/);
+  if (m) { let yr = parseInt(m[2]); if (yr < 100) yr += 2000; return { month: MONTH_MAP[m[1]], year: yr }; }
+  // Match ISO dates "2022-01-01"
+  const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return { year: parseInt(iso[1]), month: parseInt(iso[2]) };
+  // Match "1/1/2022"
+  const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (mdy) return { month: parseInt(mdy[1]), year: parseInt(mdy[3]) };
+  return null;
+}
+
+// Helper: find date columns in a row
 function findDateColumns(row) {
   const cols = [];
   if (!row) return cols;
   for (let i = 0; i < row.length; i++) {
-    const cell = row[i];
-    if (!cell) continue;
-    const s = String(cell);
-    // Match dates like "2022-01-01" or "1/1/2022" or Date objects serialized
-    const dateMatch = s.match(/(\d{4})-(\d{2})-(\d{2})/) || s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-    if (dateMatch) {
-      let year, month;
-      if (s.match(/(\d{4})-(\d{2})-(\d{2})/)) {
-        year = parseInt(RegExp.$1); month = parseInt(RegExp.$2);
-      } else {
-        month = parseInt(dateMatch[1]); year = parseInt(dateMatch[3]);
-      }
-      if (year >= 2020 && year <= 2030 && month >= 1 && month <= 12) {
-        cols.push({ col: i, year, month });
-      }
+    const r = parseMonthYear(row[i]);
+    if (r && r.year >= 2020 && r.year <= 2030 && r.month >= 1 && r.month <= 12) {
+      cols.push({ col: i, year: r.year, month: r.month });
     }
   }
   return cols;
@@ -652,20 +657,15 @@ async function parseAR(data, entity, sheetName) {
   console.log(`  Header row: ${headerIdx}, buckets:`, bucketCols.map(b => b.bucket));
 
   let count = 0;
-  // Data rows: Col A has the date, then bucket columns have amounts
+  // Data rows: date is in col 0 or col 1 (check both), then bucket columns have amounts
   for (let i = headerIdx + 1; i < data.length; i++) {
     const row = data[i];
-    if (!row || !row[0]) continue;
+    if (!row) continue;
 
-    // Parse date from col A
-    const dateStr = String(row[0]);
-    const dateMatch = dateStr.match(/(\d{4})-(\d{2})-(\d{2})/) || dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-    let year, month;
-    if (dateMatch) {
-      if (dateStr.match(/(\d{4})-(\d{2})-(\d{2})/)) { year = parseInt(RegExp.$1); month = parseInt(RegExp.$2); }
-      else { month = parseInt(dateMatch[1]); year = parseInt(dateMatch[3]); }
-    }
-    if (!year || !month) continue;
+    // Parse date from col 0 or col 1
+    let parsed = parseMonthYear(row[0]) || parseMonthYear(row[1]);
+    if (!parsed) continue;
+    const { year, month } = parsed;
 
     for (const bc of bucketCols) {
       const val = parseNumber(row[bc.col]);
