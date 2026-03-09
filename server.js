@@ -244,7 +244,37 @@ async function handleToolCall(toolName, args) {
 }
 
 // ================================================================
-// MCP SSE ENDPOINT
+// MCP STREAMABLE HTTP ENDPOINT (for LibreChat v0.7+ / modern clients)
+// POST /mcp — handles all JSON-RPC methods in a single endpoint
+// ================================================================
+
+app.post('/mcp', async (req, res) => {
+  const { method, params, id } = req.body;
+  try {
+    if (method === 'initialize') {
+      return res.json({
+        jsonrpc: "2.0", id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: "convor-finance-mcp", version: "1.0.0" }
+        }
+      });
+    }
+    if (method === 'notifications/initialized') return res.status(204).send();
+    if (method === 'tools/list') return res.json({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+    if (method === 'tools/call') {
+      const result = await handleToolCall(params.name, params.arguments || {});
+      return res.json({ jsonrpc: "2.0", id, result });
+    }
+    return res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method: ${method}` } });
+  } catch (err) {
+    return res.json({ jsonrpc: "2.0", id, error: { code: -32603, message: err.message } });
+  }
+});
+
+// ================================================================
+// MCP SSE ENDPOINT (legacy — kept for backward compatibility)
 // ================================================================
 
 app.get('/sse', (req, res) => {
@@ -334,12 +364,10 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
 
       const nl = name.toLowerCase();
 
-      // Detect entity from sheet name
       let entity = 'Consolidated';
       if (nl.includes('xyz')) entity = 'XYZ';
       else if (nl.includes('abc')) entity = 'ABC';
 
-      // Detect type from sheet name
       if (nl.startsWith('pl-') || nl.includes('p&l') || nl.includes('profit and loss') || nl.includes('income statement')) {
         const count = await parsePL(data, entity, name);
         if (count > 0) results[name] = count;
@@ -369,27 +397,22 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
 });
 
 // ================================================================
-// PARSERS — matched to the exact Excel file structure
+// PARSERS
 // ================================================================
 
-// Helper: parse a cell into {month, year} if it's a date
 const MONTH_MAP = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
 function parseMonthYear(s) {
   if (!s) return null;
   s = String(s).trim().toLowerCase();
-  // Match "Jan-22", "Feb-24", "Mar-2022", "Jan 22", etc.
   const m = s.match(/^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[- ]?(\d{2,4})$/);
   if (m) { let yr = parseInt(m[2]); if (yr < 100) yr += 2000; return { month: MONTH_MAP[m[1]], year: yr }; }
-  // Match ISO dates "2022-01-01"
   const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return { year: parseInt(iso[1]), month: parseInt(iso[2]) };
-  // Match "1/1/2022"
   const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (mdy) return { month: parseInt(mdy[1]), year: parseInt(mdy[3]) };
   return null;
 }
 
-// Helper: find date columns in a row
 function findDateColumns(row) {
   const cols = [];
   if (!row) return cols;
@@ -402,7 +425,6 @@ function findDateColumns(row) {
   return cols;
 }
 
-// Helper: find the row with date columns
 function findDateRow(data, maxRows) {
   for (let i = 0; i < Math.min(data.length, maxRows || 10); i++) {
     const cols = findDateColumns(data[i]);
@@ -411,45 +433,22 @@ function findDateRow(data, maxRows) {
   return null;
 }
 
-// P&L Parser: Col A = GM mapping, Col B = P&L mapping (Recurring/Non-recurring), Col C = account name, data starts Col D+
 async function parsePL(data, entity, sheetName) {
   console.log(`Parsing P&L: "${sheetName}" entity=${entity}`);
-  
-  // Find the row with dates (should be row 3 = index 2)
   const dateInfo = findDateRow(data, 10);
   if (!dateInfo) { console.log(`  No date row found in ${sheetName}`); return 0; }
-  
   const { rowIdx, dateCols } = dateInfo;
   console.log(`  Date row: ${rowIdx}, ${dateCols.length} month columns found`);
-
   let count = 0;
   let currentPLCategory = 'Revenue';
-
   for (let i = rowIdx + 1; i < data.length; i++) {
     const row = data[i];
     if (!row) continue;
-
-    // In this file structure:
-    // Col 0 (A) = GM category mapping (e.g., "Recurring", "Non-recurring", or GM category name)
-    // Col 1 (B) = P&L mapping or recurring/non-recurring 
-    // Col 2 (C) = account name (starts with spaces and account number)
-    // For XYZ: col0 is empty for headers, col1 has Recurring/Non-recurring, col2 has account
-    // For ABC: col0 has GM category, col1 has Recurring/Non-recurring, col2 has account
-
-    // Find the account name — it's the last text column before numbers start
-    let accountName = null;
-    let gmCategory = null;
-    let recurType = null;
-    
-    // Check columns 0, 1, 2 for text
     const c0 = row[0] ? String(row[0]).trim() : '';
     const c1 = row[1] ? String(row[1]).trim() : '';
     const c2 = row[2] ? String(row[2]).trim() : '';
-
-    // Detect category header rows (e.g., "Revenue", "Direct Costs", "Operating Expenses")
     const headerText = (c2 || c1 || c0).toLowerCase();
     if (!c2 && !c1 && c0) {
-      // Only col A has text — might be a category header
       if (headerText.includes('revenue') || headerText.includes('income')) currentPLCategory = 'Revenue';
       else if (headerText.includes('direct cost') || headerText.includes('cost of') || headerText.includes('cogs')) currentPLCategory = 'Direct Costs';
       else if (headerText.includes('gross')) currentPLCategory = 'Gross Margin';
@@ -460,7 +459,6 @@ async function parsePL(data, entity, sheetName) {
       continue;
     }
     if (c2 && !hasAnyNumber(row, dateCols)) {
-      // Header row with account name but no numbers
       const h = c2.toLowerCase();
       if (h.includes('revenue') || h.includes('income')) currentPLCategory = 'Revenue';
       else if (h.includes('direct cost') || h.includes('cost of')) currentPLCategory = 'Direct Costs';
@@ -470,34 +468,17 @@ async function parsePL(data, entity, sheetName) {
       else if (h.includes('overhead') || h.includes('g&a')) currentPLCategory = 'Overhead';
       continue;
     }
-
-    // Data row
-    if (c2) {
-      accountName = c2.replace(/^\s+/, '');
-      gmCategory = c0 || null;
-      recurType = c1 || null;
-    } else if (c1) {
-      accountName = c1.replace(/^\s+/, '');
-      recurType = c0 || null;
-    } else if (c0) {
-      accountName = c0.replace(/^\s+/, '');
-    }
-
+    let accountName = null, gmCategory = null, recurType = null;
+    if (c2) { accountName = c2.replace(/^\s+/, ''); gmCategory = c0 || null; recurType = c1 || null; }
+    else if (c1) { accountName = c1.replace(/^\s+/, ''); recurType = c0 || null; }
+    else if (c0) { accountName = c0.replace(/^\s+/, ''); }
     if (!accountName) continue;
-
-    // Skip total/subtotal rows
     const acctLower = accountName.toLowerCase();
     if (acctLower.startsWith('total') || acctLower.startsWith('subtotal') || acctLower.includes('net income') || acctLower.includes('ebitda') || acctLower.includes('gross profit') || acctLower.includes('gross margin') || acctLower === 'mapping to gm' || acctLower === 'mapping to p&l' || acctLower === 'profit and loss') continue;
-
-    // Insert data for each month column
     for (const dc of dateCols) {
       const val = parseNumber(row[dc.col]);
       if (val === null || val === 0) continue;
-
-      await pool.query(
-        `INSERT INTO profit_loss (entity, gm_category, pl_category, account_name, period_year, period_month, amount, data_type) VALUES ($1,$2,$3,$4,$5,$6,$7,'actual')`,
-        [entity, gmCategory, currentPLCategory, accountName, dc.year, dc.month, val]
-      );
+      await pool.query(`INSERT INTO profit_loss (entity, gm_category, pl_category, account_name, period_year, period_month, amount, data_type) VALUES ($1,$2,$3,$4,$5,$6,$7,'actual')`, [entity, gmCategory, currentPLCategory, accountName, dc.year, dc.month, val]);
       count++;
     }
   }
@@ -505,58 +486,32 @@ async function parsePL(data, entity, sheetName) {
   return count;
 }
 
-// Balance Sheet Parser: Col A = Mapping, Col B = account name, data starts Col C+
 async function parseBS(data, entity, sheetName) {
   console.log(`Parsing BS: "${sheetName}" entity=${entity}`);
   const dateInfo = findDateRow(data, 10);
   if (!dateInfo) { console.log(`  No date row found in ${sheetName}`); return 0; }
   const { rowIdx, dateCols } = dateInfo;
-  console.log(`  Date row: ${rowIdx}, ${dateCols.length} month columns found`);
-
-  let count = 0;
-  let currentCategory = 'Assets';
-  let currentSubCategory = '';
-
+  let count = 0, currentCategory = 'Assets', currentSubCategory = '';
   for (let i = rowIdx + 1; i < data.length; i++) {
     const row = data[i];
     if (!row) continue;
-    
     const c0 = row[0] ? String(row[0]).trim() : '';
     const c1 = row[1] ? String(row[1]).trim() : '';
-
-    // Account name is in col B (index 1)
     const label = c1 || c0;
     if (!label) continue;
     const labelLower = label.toLowerCase().replace(/^\s+/,'');
-
-    // Detect category
     if (!hasAnyNumber(row, dateCols)) {
       if (labelLower.includes('asset')) currentCategory = 'Assets';
       else if (labelLower.includes('liabilit')) currentCategory = 'Liabilities';
       else if (labelLower.includes('equity') || labelLower.includes('shareholder')) currentCategory = 'Equity';
-      else if (labelLower.includes('current asset')) currentSubCategory = 'Current Assets';
-      else if (labelLower.includes('fixed asset') || labelLower.includes('non-current') || labelLower.includes('long-term')) currentSubCategory = 'Non-Current';
-      else if (labelLower.includes('bank account')) currentSubCategory = 'Bank Accounts';
-      else if (labelLower.includes('accounts receivable')) currentSubCategory = 'Accounts Receivable';
-      else if (labelLower.includes('current liabilit')) currentSubCategory = 'Current Liabilities';
-      else if (labelLower.includes('long-term') || labelLower.includes('non-current liabilit')) currentSubCategory = 'Long-Term Liabilities';
       else if (label.trim().length > 2) currentSubCategory = label.trim();
       continue;
     }
-
-    // Skip totals
     if (labelLower.startsWith('total') || labelLower.includes('balance sheet')) continue;
-
-    const accountName = label.replace(/^\s+/, '');
-
     for (const dc of dateCols) {
       const val = parseNumber(row[dc.col]);
       if (val === null || val === 0) continue;
-
-      await pool.query(
-        `INSERT INTO balance_sheet (entity, category, sub_category, account_name, period_year, period_month, amount) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [entity, currentCategory, currentSubCategory, accountName, dc.year, dc.month, val]
-      );
+      await pool.query(`INSERT INTO balance_sheet (entity, category, sub_category, account_name, period_year, period_month, amount) VALUES ($1,$2,$3,$4,$5,$6,$7)`, [entity, currentCategory, currentSubCategory, label.replace(/^\s+/,''), dc.year, dc.month, val]);
       count++;
     }
   }
@@ -564,42 +519,29 @@ async function parseBS(data, entity, sheetName) {
   return count;
 }
 
-// Cash Flow Parser: Col A = account name, data starts Col B+
 async function parseCF(data, entity, sheetName) {
   console.log(`Parsing CF: "${sheetName}" entity=${entity}`);
   const dateInfo = findDateRow(data, 10);
   if (!dateInfo) { console.log(`  No date row found in ${sheetName}`); return 0; }
   const { rowIdx, dateCols } = dateInfo;
-  console.log(`  Date row: ${rowIdx}, ${dateCols.length} month columns found`);
-
-  let count = 0;
-  let currentCategory = 'Operating';
-
+  let count = 0, currentCategory = 'Operating';
   for (let i = rowIdx + 1; i < data.length; i++) {
     const row = data[i];
     if (!row) continue;
-
     const label = row[0] ? String(row[0]).trim() : '';
     if (!label) continue;
     const labelLower = label.toLowerCase();
-
     if (!hasAnyNumber(row, dateCols)) {
       if (labelLower.includes('operating')) currentCategory = 'Operating';
       else if (labelLower.includes('investing')) currentCategory = 'Investing';
       else if (labelLower.includes('financing')) currentCategory = 'Financing';
       continue;
     }
-
     if (labelLower.startsWith('total') || labelLower.startsWith('net change') || labelLower.includes('cash flow statement') || labelLower.includes('beginning') || labelLower.includes('ending')) continue;
-
     for (const dc of dateCols) {
       const val = parseNumber(row[dc.col]);
       if (val === null || val === 0) continue;
-
-      await pool.query(
-        `INSERT INTO cash_flow (entity, category, account_name, period_year, period_month, amount) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [entity, currentCategory, label, dc.year, dc.month, val]
-      );
+      await pool.query(`INSERT INTO cash_flow (entity, category, account_name, period_year, period_month, amount) VALUES ($1,$2,$3,$4,$5,$6)`, [entity, currentCategory, label, dc.year, dc.month, val]);
       count++;
     }
   }
@@ -607,74 +549,35 @@ async function parseCF(data, entity, sheetName) {
   return count;
 }
 
-// AR Aging Parser: dates in col A, aging buckets Current/1-30/31-60/61-90/91+ in header row
 async function parseAR(data, entity, sheetName) {
   console.log(`Parsing AR: "${sheetName}"`);
-
-  // Find header row with aging bucket labels
-  let headerIdx = -1;
-  let bucketCols = [];
+  let headerIdx = -1, bucketCols = [];
   for (let i = 0; i < Math.min(data.length, 10); i++) {
     const row = data[i];
     if (!row) continue;
-    const rowStr = row.map(c => String(c||'').toLowerCase()).join('|');
-    if (rowStr.includes('current') && (rowStr.includes('1 - 30') || rowStr.includes('1-30') || rowStr.includes('gross'))) {
-      headerIdx = i;
-      for (let c = 0; c < row.length; c++) {
-        const cell = String(row[c]||'').trim().toLowerCase();
-        if (cell === 'current') bucketCols.push({ col:c, bucket:'Current' });
-        else if (cell.includes('1 - 30') || cell.includes('1-30')) bucketCols.push({ col:c, bucket:'1-30 Days' });
-        else if (cell.includes('31 - 60') || cell.includes('31-60')) bucketCols.push({ col:c, bucket:'31-60 Days' });
-        else if (cell.includes('61 - 90') || cell.includes('61-90')) bucketCols.push({ col:c, bucket:'61-90 Days' });
-        else if (cell.includes('91') || cell.includes('over 90') || cell.includes('90+')) bucketCols.push({ col:c, bucket:'91+ Days' });
-      }
-      break;
+    let found = 0;
+    for (let c = 0; c < row.length; c++) {
+      const cell = String(row[c]||'').trim().toLowerCase();
+      if (cell === 'current') { bucketCols.push({col:c, bucket:'Current'}); found++; }
+      else if (cell === '1 - 30' || cell === '1-30') { bucketCols.push({col:c, bucket:'1-30 Days'}); found++; }
+      else if (cell === '31 - 60' || cell === '31-60') { bucketCols.push({col:c, bucket:'31-60 Days'}); found++; }
+      else if (cell === '61 - 90' || cell === '61-90') { bucketCols.push({col:c, bucket:'61-90 Days'}); found++; }
+      else if (cell === '91+' || cell === '91 +') { bucketCols.push({col:c, bucket:'91+ Days'}); found++; }
     }
+    if (found >= 3) { headerIdx = i; break; }
   }
-
-  // Also check for the sub-header row (row 3 in the file has "Current", "1 - 30", etc.)
-  if (bucketCols.length === 0) {
-    for (let i = 0; i < Math.min(data.length, 10); i++) {
-      const row = data[i];
-      if (!row) continue;
-      let found = 0;
-      for (let c = 0; c < row.length; c++) {
-        const cell = String(row[c]||'').trim().toLowerCase();
-        if (cell === 'current') { bucketCols.push({col:c, bucket:'Current'}); found++; }
-        else if (cell === '1 - 30' || cell === '1-30') { bucketCols.push({col:c, bucket:'1-30 Days'}); found++; }
-        else if (cell === '31 - 60' || cell === '31-60') { bucketCols.push({col:c, bucket:'31-60 Days'}); found++; }
-        else if (cell === '61 - 90' || cell === '61-90') { bucketCols.push({col:c, bucket:'61-90 Days'}); found++; }
-        else if (cell === '91+' || cell === '91 +') { bucketCols.push({col:c, bucket:'91+ Days'}); found++; }
-      }
-      if (found >= 3) { headerIdx = i; break; }
-    }
-  }
-
-  if (headerIdx < 0 || bucketCols.length === 0) {
-    console.log(`  No aging buckets found in ${sheetName}`);
-    return 0;
-  }
-  console.log(`  Header row: ${headerIdx}, buckets:`, bucketCols.map(b => b.bucket));
-
+  if (headerIdx < 0 || bucketCols.length === 0) { console.log(`  No aging buckets found in ${sheetName}`); return 0; }
   let count = 0;
-  // Data rows: date is in col 0 or col 1 (check both), then bucket columns have amounts
   for (let i = headerIdx + 1; i < data.length; i++) {
     const row = data[i];
     if (!row) continue;
-
-    // Parse date from col 0 or col 1
     let parsed = parseMonthYear(row[0]) || parseMonthYear(row[1]);
     if (!parsed) continue;
     const { year, month } = parsed;
-
     for (const bc of bucketCols) {
       const val = parseNumber(row[bc.col]);
       if (val === null || val === 0) continue;
-
-      await pool.query(
-        `INSERT INTO ar_aging (entity, customer_name, aging_bucket, amount, period_year, period_month) VALUES ($1,$2,$3,$4,$5,$6)`,
-        ['Consolidated', `Period ${year}-${String(month).padStart(2,'0')}`, bc.bucket, val, year, month]
-      );
+      await pool.query(`INSERT INTO ar_aging (entity, customer_name, aging_bucket, amount, period_year, period_month) VALUES ($1,$2,$3,$4,$5,$6)`, ['Consolidated', `Period ${year}-${String(month).padStart(2,'0')}`, bc.bucket, val, year, month]);
       count++;
     }
   }
@@ -682,33 +585,24 @@ async function parseAR(data, entity, sheetName) {
   return count;
 }
 
-// Budget Parser: dates in row 5, account names in col A, data starts col B
 async function parseBudget(data, entity, sheetName) {
   console.log(`Parsing Budget: "${sheetName}"`);
   const dateInfo = findDateRow(data, 10);
   if (!dateInfo) { console.log(`  No date row found in ${sheetName}`); return 0; }
   const { rowIdx, dateCols } = dateInfo;
-  console.log(`  Date row: ${rowIdx}, ${dateCols.length} month columns found`);
-
   let count = 0;
   for (let i = rowIdx + 1; i < data.length; i++) {
     const row = data[i];
     if (!row) continue;
-
     const label = row[0] ? String(row[0]).trim() : '';
     if (!label) continue;
     const labelLower = label.toLowerCase();
     if (labelLower.startsWith('total') || labelLower.includes('margin %') || labelLower === 'profit and loss') continue;
     if (!hasAnyNumber(row, dateCols)) continue;
-
     for (const dc of dateCols) {
       const val = parseNumber(row[dc.col]);
       if (val === null || val === 0) continue;
-
-      await pool.query(
-        `INSERT INTO budget (entity, account_name, period_year, period_month, amount) VALUES ($1,$2,$3,$4,$5)`,
-        ['Consolidated', label, dc.year, dc.month, val]
-      );
+      await pool.query(`INSERT INTO budget (entity, account_name, period_year, period_month, amount) VALUES ($1,$2,$3,$4,$5)`, ['Consolidated', label, dc.year, dc.month, val]);
       count++;
     }
   }
@@ -716,7 +610,6 @@ async function parseBudget(data, entity, sheetName) {
   return count;
 }
 
-// Helpers
 function parseNumber(val) {
   if (val === null || val === undefined || val === '') return null;
   const n = parseFloat(String(val).replace(/[,$]/g, ''));
@@ -760,6 +653,7 @@ async function start() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Convor Finance MCP Server running on port ${PORT}`);
     console.log(`  Upload page: /upload`);
+    console.log(`  MCP streamable: /mcp`);
     console.log(`  SSE endpoint: /sse`);
     console.log(`  Health: /health`);
   });
